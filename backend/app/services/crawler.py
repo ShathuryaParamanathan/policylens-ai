@@ -2,6 +2,8 @@
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
+from .url_security import validate_url
+
 import re
 
 POLICY_KEYWORDS = {
@@ -41,6 +43,13 @@ POLICY_KEYWORDS = {
         "security-policy"
     ]
 }
+
+MAX_HTML_SIZE = 5 * 1024 * 1024       # 5 MB
+MAX_TEXT_LENGTH = 500_000             # 500k characters
+MAX_LINKS = 100
+MAX_POLICY_LINKS = 20
+MAX_REDIRECTS = 5
+PAGE_TIMEOUT_MS = 30_000
 
 def extract_links(page_url: str, html: str):
 
@@ -82,51 +91,171 @@ def extract_links(page_url: str, html: str):
 
     return links
 
+def validate_request_url(request_url: str) -> str:
+    """
+    Validate every URL requested by Playwright.
+
+    This protects against:
+    - unsafe redirects
+    - internal network requests
+    - private IP addresses
+    - localhost access
+    """
+
+    return validate_url(request_url)
+
 def crawl_page(url: str):
+
+    # -----------------------------------------
+    # 1. Validate initial URL
+    # -----------------------------------------
+
+    safe_url = validate_url(
+        url
+    )
+
+    # -----------------------------------------
+    # 2. Launch browser
+    # -----------------------------------------
+
     with sync_playwright() as p:
 
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True
+        )
 
         page = browser.new_page()
 
+        # -------------------------------------
+        # 3. Intercept browser requests
+        # -------------------------------------
+
+        page.route(
+            "**/*",
+            handle_route
+        )
+
+        # -------------------------------------
+        # 4. Navigate
+        # -------------------------------------
+
         page.goto(
-            url,
+            safe_url,
             wait_until="domcontentloaded",
-            timeout=30000
+            timeout=PAGE_TIMEOUT_MS
         )
 
         title = page.title()
+
         html = page.content()
 
-        # Extract visible rendered text from the page
-        text = page.locator("body").inner_text(timeout=10000)
+        # -------------------------------------
+        # 5. HTML size protection
+        # -------------------------------------
+
+        html_size = len(
+            html.encode("utf-8")
+        )
+
+        if html_size > MAX_HTML_SIZE:
+
+            browser.close()
+
+            raise ValueError(
+                "Page HTML exceeds the maximum "
+                "allowed size."
+            )
+
+        # -------------------------------------
+        # 6. Extract rendered text
+        # -------------------------------------
+
+        text = page.locator(
+            "body"
+        ).inner_text(
+            timeout=10000
+        )
+
+        # -------------------------------------
+        # 7. Text size protection
+        # -------------------------------------
+
+        if len(text) > MAX_TEXT_LENGTH:
+
+            text = text[
+                :MAX_TEXT_LENGTH
+            ]
 
         browser.close()
-        cleaned_text = clean_content(html)
 
+    # -----------------------------------------
+    # 8. Clean content
+    # -----------------------------------------
 
+    cleaned_text = clean_content(
+        html
+    )
 
-    # Normalize whitespace
-    text = re.sub(r"[ \t]+", " ", text)
+    # -----------------------------------------
+    # 9. Normalize text
+    # -----------------------------------------
 
-    # Normalize excessive blank lines
-    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    text = re.sub(
+        r"[ \t]+",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"\n\s*\n+",
+        "\n\n",
+        text
+    )
 
     text = text.strip()
-    links = extract_links(url, html)
 
-    policy_links = find_policy_links(links)
-    headings = extract_headings(html)
+    # -----------------------------------------
+    # 10. Extract links
+    # -----------------------------------------
+
+    links = extract_links(
+        safe_url,
+        html
+    )
+
+    links = links[
+        :MAX_LINKS
+    ]
+
+    # -----------------------------------------
+    # 11. Find policy links
+    # -----------------------------------------
+
+    policy_links = find_policy_links(
+        links
+    )
+
+    policy_links = policy_links[
+        :MAX_POLICY_LINKS
+    ]
+
+    # -----------------------------------------
+    # 12. Extract headings
+    # -----------------------------------------
+
+    headings = extract_headings(
+        html
+    )
 
     return {
-        "url": url,
+        "url": safe_url,
         "title": title,
         "html": html,
         "text": text,
         "cleaned_text": cleaned_text,
         "links": links,
         "headings": headings,
-        "policy_links": policy_links
+        "policy_links": policy_links,
     }
 
 def normalize_url(url: str):
@@ -205,41 +334,79 @@ def crawl_policy_pages(policy_links):
     return documents
 
 def clean_content(html: str):
-
     soup = BeautifulSoup(html, "html.parser")
 
-    # Remove elements that usually do not contain useful content
+    # Remove elements that are not useful for policy analysis
     for element in soup([
         "script",
         "style",
         "noscript",
         "svg",
         "template",
-        "nav"
-    ]):
-        element.decompose()
-
-    # Remove common page-level irrelevant sections
-    for element in soup([
+        "nav",
         "header",
-        "footer"
+        "footer",
+        "form"
     ]):
         element.decompose()
 
-    # Extract visible text
     text = soup.get_text(
         separator="\n",
         strip=True
     )
 
-    # Normalize whitespace
+    # Remove PGP public key blocks
+    text = re.sub(
+        r"-----BEGIN PGP PUBLIC KEY BLOCK-----.*?"
+        r"-----END PGP PUBLIC KEY BLOCK-----",
+        "",
+        text,
+        flags=re.DOTALL
+    )
+
+    # Normalize spaces
+    text = re.sub(r"[ \t]+", " ", text)
+
+    # Normalize blank lines
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+
     lines = []
 
     for line in text.splitlines():
-
-        line = re.sub(r"\s+", " ", line).strip()
+        line = line.strip()
 
         if line:
             lines.append(line)
 
     return "\n".join(lines)
+
+
+def handle_route(route):
+
+    request = route.request
+
+    if request.resource_type in BLOCKED_RESOURCE_TYPES:
+        route.abort()
+        return
+
+    try:
+
+        validate_request_url(
+            request.url
+        )
+
+        route.continue_()
+
+    except ValueError as error:
+
+        print(
+            "Blocked unsafe request:",
+            request.url
+        )
+
+        print(
+            "Reason:",
+            error
+        )
+
+        route.abort()       
